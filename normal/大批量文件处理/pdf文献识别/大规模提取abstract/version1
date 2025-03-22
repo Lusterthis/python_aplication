@@ -1,0 +1,151 @@
+#只能匹配到abstract才有希望，否则会提取奇怪的信息
+import os
+import re
+import fitz
+import pandas as pd
+import gc
+import gc
+from collections import defaultdict  # 添加缺失的导入
+
+def clean_excel_text(text):
+    """清除Excel不允许的非法字符"""
+    # 保留制表符、换行符、回车符（ASCII 9,10,13），其余控制字符替换为空格
+    cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', ' ', str(text))
+    # 移除Unicode私有区域字符（如U+E000-U+F8FF）
+    cleaned = re.sub(r'[\ue000-\uf8ff]', '', cleaned)
+    # 替换连续空格
+    return re.sub(r'\s+', ' ', cleaned).strip()
+
+
+def extract_abstract(pdf_path):
+    try:
+        abstract_pattern = re.compile(
+            r'(?i)(\babstract\b|a\s*b\s*s\s*t\s*r\s*a\s*c\s*t)\b[\s:]*'
+        )
+        end_pattern = re.compile(
+            r'(?i)(^\s*(introduction|1\s*\.|i\s*n\s*t\s*r\s*o\s*d\s*u\s*c\s*t\s*i\s*o\s*n)\b|key\s?words)'
+        )
+
+        full_text = []
+        column_layout = False
+
+        with fitz.open(pdf_path) as doc:
+            # ===== 分栏分析 =====
+            columns = defaultdict(list)
+            for page in doc[:5]:
+                blocks = page.get_text("blocks", sort=False)
+                for b in blocks:
+                    x0 = b[0]
+                    col_id = int(x0 // 40)
+                    columns[col_id].append(b)
+
+            if len(columns) > 1:
+                column_layout = True
+                sorted_blocks = []
+                for col in sorted(columns):
+                    sorted_blocks += sorted(columns[col], key=lambda x: x[1])
+                full_text = [b[4].replace('-\n', '').strip() + '¶' for b in sorted_blocks]
+            else:
+                # ===== 常规处理 =====
+                for page in doc[:2]:
+                    blocks = page.get_text("blocks", sort=True)
+                    page_height = page.rect.height
+                    for b in blocks:
+                        y0, y1 = b[1], b[3]
+                        if y1 < 0.07 * page_height or y0 > 0.93 * page_height:
+                            continue
+                        text = b[4].replace('-\n', '').strip()
+                        if len(text) < 20 and (y1 < 0.1 * page_height or y0 > 0.9 * page_height):
+                            continue
+                        full_text.append(text + '¶')
+
+            full_text = ' '.join(full_text).replace('¶ ', '\n\n').replace('¶', '')
+
+            # ===== 截断策略 =====
+            match = abstract_pattern.search(full_text)
+            start = match.end() if match else 0
+
+            if column_layout:
+                # 简化的分栏截断逻辑
+                end = full_text.find('\n\n', start + 500)  # 查找双换行符
+                end = end if end != -1 else len(full_text)
+            else:
+                end_match = end_pattern.search(full_text[start:])
+                end = start + end_match.start() if end_match else None
+
+            abstract = full_text[start:end].strip() if end else full_text[start:].strip()
+            return re.sub(r'\s+([.:,;])', r'\1', abstract[:20000])
+
+    except Exception as e:
+        return f"Extraction Error: {str(e)}"
+    finally:
+        gc.collect()
+
+
+def extract_article_name(filename):
+    """更健壮的文件名解析"""
+    base_name = os.path.splitext(filename)[0]
+    separators = [' - ', '–', '-', '_', '：']
+    for sep in separators:
+        if sep in base_name:
+            return base_name.split(sep)[-1].strip()
+    return base_name
+
+
+
+def process_pdfs(folder_path):
+    data = []
+    error_log = []
+
+    for filename in os.listdir(folder_path):
+        if not filename.lower().endswith('.pdf'):
+            continue
+
+        pdf_path = os.path.join(folder_path, filename)
+        status = "Success"
+        article_name = ""
+        abstract = ""
+        error_msg = ""
+
+        try:
+            # 文件名解析始终执行
+            article_name = extract_article_name(filename)
+
+            # 尝试提取摘要
+            abstract = extract_abstract(pdf_path)
+
+            # 有效性验证
+            if len(abstract) < 50:
+                raise ValueError(f"Abstract too short ({len(abstract)} chars)")
+
+        except Exception as e:
+            status = "Failed"
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            error_log.append(f"{filename}: {error_msg}")
+            print(f"\033[31mFailed: {filename} - {error_msg}\033[0m")
+
+        finally:
+            # 无论成功与否都记录到Excel
+            data.append({
+                'Filename': clean_excel_text(filename),
+                'Article Name': clean_excel_text(article_name),
+                'Abstract': clean_excel_text(abstract) if status == "Success" else error_msg,
+                'Status': status,
+                'Error Info': clean_excel_text(error_msg)
+            })
+
+    # 生成Excel（包含所有记录）
+    df = pd.DataFrame(data)
+    columns_order = ['Filename', 'Article Name', 'Status', 'Abstract', 'Error Info']
+    df[columns_order].to_excel('results.xlsx', index=False, engine='openpyxl')
+
+    # 保存详细错误日志
+    if error_log:
+        with open('error_log.txt', 'w') as f:
+            f.write('\n'.join(error_log))
+
+    print(f"处理完成！总计：{len(data)}，成功：{len(df[df['Status'] == 'Success'])}，失败：{len(error_log)}")
+
+
+if __name__ == "__main__":
+    process_pdfs(r"D:\Users\bo\PycharmProjects\DocH\CRC-6")
